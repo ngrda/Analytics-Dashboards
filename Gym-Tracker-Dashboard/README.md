@@ -1,4 +1,4 @@
-# Gym Progress Dashboard (Flask + pandas)
+*# Gym Progress Dashboard (Flask + pandas)
 
 A self-hosted training dashboard that reads your workouts and body
 metrics straight from a single Excel file and turns them into an
@@ -16,7 +16,7 @@ It's not Streamlit. It's a minimal server + your usual HTML.
 
 ## Run
 
-Just open the link: **[https://gym-progress-dashboard.onrender.com**](https://gym-tracker-dashboard.onrender.com)
+Just open the link: **[https://gym-progress-dashboard.onrender.com](https://gym-tracker-dashboard.onrender.com)**
 
 Or run it locally:
 
