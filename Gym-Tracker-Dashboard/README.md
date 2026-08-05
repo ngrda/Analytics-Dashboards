@@ -1,4 +1,4 @@
-*# Gym Progress Dashboard (Flask + pandas)
+# Gym Progress Dashboard (Flask + pandas)
 
 A self-hosted training dashboard that reads your workouts and body
 metrics straight from a single Excel file and turns them into an
