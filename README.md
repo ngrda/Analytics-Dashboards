@@ -11,6 +11,7 @@ A curated collection of dashboard builds and demos.
 * **Expense & Revenue Tracker Dashboard** — [Live Demo](https://expense-revenue-tracker-dashboard.onrender.com)
 * **Gym Progress Dashboard** — [Live Demo](https://gym-progress-dashboard.onrender.com)
 * **Events Insight & Sales Dashboard** — [Live Demo](https://moonlight-movies-analysis.onrender.com)
+* **Soccer Analytics Dashboard** — [Live Demo](https://soccer-analytics-dashboard.onrender.com)
 
 ---
 
@@ -30,6 +31,11 @@ A curated collection of dashboard builds and demos.
   Weekly sales dashboard for an event/concession business that reads data straight from CSV files and turns it into an interactive report: KPIs, category breakdown, top products, and weekly trends.  
   *Tech stack:* Flask, pandas, Tailwind CSS, Chart.js.  
   👉 [Documentation](./Events-Insight-and-Sales-Dashboard) · [Live Demo](https://moonlight-movies-analysis.onrender.com)
+
+* **[Soccer-Analytics-Dashboard/](./Soccer-Analytics-Dashboard)** ⚽  
+  NAIA soccer team analytics dashboard that reads a team's Roster and Coach's View stats straight from CSV or PDF files and turns them into an interactive report: scoring leaders, team vs. opponent production, shots-to-goals efficiency, a searchable roster, and auto-generated insights.  
+  *Tech stack:* HTML/CSS/JS, Chart.js, PapaParse, pdf.js.  
+  👉 [Documentation](./Soccer-Analytics-Dashboard) · [Live Demo](https://soccer-analytics-dashboard.onrender.com)
 
 ---
 
