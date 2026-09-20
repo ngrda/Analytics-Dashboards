@@ -1053,6 +1053,42 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--chart-revenue);
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-secondary); }
 .empty-state p:first-child { font-size: 16px; font-weight: 500; color: var(--text); margin-bottom: 6px; }
 
+/* ── Upload dropzones ── */
+.upload-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    max-width: 560px;
+    margin: 28px auto 0;
+    text-align: left;
+}
+.dropzone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 6px;
+    padding: 28px 16px;
+    border: 1.5px dashed var(--border-hover);
+    border-radius: var(--radius-lg, 12px);
+    background: var(--surface);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+.dropzone:hover { border-color: var(--chart-revenue); background: var(--surface-2); }
+.dropzone.drag-over { border-color: var(--chart-revenue); background: var(--accent-soft); }
+.dropzone.upload-ok { border-style: solid; border-color: var(--positive); }
+.dropzone.upload-error { border-style: solid; border-color: var(--negative); }
+.dropzone-icon { color: var(--text-muted); }
+.dropzone.upload-ok .dropzone-icon { color: var(--positive); }
+.dropzone.upload-error .dropzone-icon { color: var(--negative); }
+.dropzone-title { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 2px; }
+.dropzone-sub { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+.dropzone-status { font-size: 11px; font-weight: 500; min-height: 14px; }
+.dropzone-status.is-ok { color: var(--positive); }
+.dropzone-status.is-error { color: var(--negative); }
+.dropzone-status.is-busy { color: var(--text-muted); }
+
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
 

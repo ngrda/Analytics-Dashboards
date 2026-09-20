@@ -48,7 +48,25 @@ function filterChartData(labels, values) {
 
 const MIX_COLORS = ['#f5b942', '#38bdf8', '#a78bfa', '#fb7185', '#52525b'];
 const MIX_LABELS = ['Popcorn', 'Snowcones', "Polly's Pop", 'Pioneer', 'Others'];
-const CATEGORY_COLORS = ['#f5b942', '#38bdf8', '#a78bfa', '#fb7185', '#34d399', '#facc15', '#60a5fa', '#f472b6', '#c084fc'];
+// 15 visually distinct colors so category legends/donuts never repeat a
+// color even when "Others" is fully split out (e.g. 10 categories).
+const CATEGORY_COLORS = [
+    '#f5b942', '#38bdf8', '#a78bfa', '#fb7185', '#34d399',
+    '#facc15', '#60a5fa', '#f472b6', '#c084fc', '#fb923c',
+    '#2dd4bf', '#ef4444', '#84cc16', '#22d3ee', '#e879f9',
+];
+// Shared palette for charts where every bar/point represents a different
+// week or product (as opposed to a fixed legend like MIX_COLORS) - 15
+// visually distinct hues so up to 15 weeks/products never repeat a color;
+// only cycles back to the start past that.
+const WEEK_COLORS = [
+    '#f5b942', '#38bdf8', '#a78bfa', '#fb7185', '#34d399',
+    '#facc15', '#60a5fa', '#f472b6', '#c084fc', '#fb923c',
+    '#2dd4bf', '#ef4444', '#84cc16', '#22d3ee', '#e879f9',
+];
+function colorPalette(n) {
+    return Array.from({ length: n }, (_, i) => WEEK_COLORS[i % WEEK_COLORS.length]);
+}
 
 const TOOLTIP_STYLE = {
     backgroundColor: '#18181b',
@@ -147,6 +165,101 @@ function closeModal() {
     document.getElementById('modal-overlay').classList.add('hidden');
 }
 
+function openUploadModal() {
+    document.getElementById('upload-modal-overlay').classList.remove('hidden');
+}
+
+function closeUploadModal() {
+    document.getElementById('upload-modal-overlay').classList.add('hidden');
+}
+
+async function handleCsvUpload(file, kind, zoneEl, statusEl) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+        zoneEl.classList.remove('upload-ok');
+        zoneEl.classList.add('upload-error');
+        statusEl.textContent = 'Not a .csv file';
+        statusEl.className = 'dropzone-status is-error';
+        return;
+    }
+
+    zoneEl.classList.remove('upload-ok', 'upload-error');
+    statusEl.textContent = 'Uploading…';
+    statusEl.className = 'dropzone-status is-busy';
+
+    const formData = new FormData();
+    formData.append(kind, file, file.name);
+
+    try {
+        const res = await fetch(`${API}/api/upload`, { method: 'POST', body: formData });
+        let data;
+        try {
+            data = await res.json();
+        } catch (parseErr) {
+            // Server returned something that isn't JSON (e.g. a raw HTML
+            // error page from an unhandled exception) - Safari reports that
+            // as a cryptic native "The string did not match the expected
+            // pattern." instead of a JSON parse error, so surface something
+            // readable instead of letting that leak to the user.
+            throw new Error(`Server error (${res.status}) - check the terminal running app.py for details`);
+        }
+        if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+        const info = data[kind];
+        zoneEl.classList.add('upload-ok');
+        statusEl.textContent = info
+            ? `${file.name} · ${info.weeks_detected} week${info.weeks_detected === 1 ? '' : 's'} detected`
+            : `${file.name} uploaded`;
+        statusEl.className = 'dropzone-status is-ok';
+
+        await refresh();
+    } catch (err) {
+        zoneEl.classList.add('upload-error');
+        statusEl.textContent = err.message || 'Upload failed';
+        statusEl.className = 'dropzone-status is-error';
+    }
+}
+
+function wireDropzone(zoneId, inputId, statusId, kind) {
+    const zone = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);
+    const status = document.getElementById(statusId);
+    if (!zone || !input || !status) return;
+
+    input.addEventListener('change', () => {
+        if (input.files?.[0]) handleCsvUpload(input.files[0], kind, zone, status);
+        input.value = '';
+    });
+
+    ['dragenter', 'dragover'].forEach((evt) => {
+        zone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            zone.classList.add('drag-over');
+        });
+    });
+    ['dragleave', 'dragend', 'drop'].forEach((evt) => {
+        zone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            zone.classList.remove('drag-over');
+        });
+    });
+    zone.addEventListener('drop', (e) => {
+        const file = e.dataTransfer?.files?.[0];
+        if (file) handleCsvUpload(file, kind, zone, status);
+    });
+}
+
+wireDropzone('dz-global-onboard', 'file-global-onboard', 'dz-global-onboard-status', 'global');
+wireDropzone('dz-indi-onboard', 'file-indi-onboard', 'dz-indi-onboard-status', 'individual');
+wireDropzone('dz-global-modal', 'file-global-modal', 'dz-global-modal-status', 'global');
+wireDropzone('dz-indi-modal', 'file-indi-modal', 'dz-indi-modal-status', 'individual');
+
+bindIfExists('btn-upload', 'click', openUploadModal);
+bindIfExists('upload-modal-close', 'click', closeUploadModal);
+bindIfExists('upload-modal-overlay', 'click', (e) => { if (e.target.id === 'upload-modal-overlay') closeUploadModal(); });
+
 function hideAllDashboards() {
     ['empty-state', 'overview-dashboard', 'dashboard', 'analytics-dashboard', 'products-dashboard', 'products-overview-dashboard', 'total-products-dashboard', 'category-dashboard'].forEach((id) => {
         const el = document.getElementById(id);
@@ -224,6 +337,7 @@ async function renderTotalProductsPage() {
         if (totalProductsChart) {
             totalProductsChart.data.labels = filteredWeeks.map((w) => w.label);
             totalProductsChart.data.datasets[0].data = filteredWeeks.map((w) => Number(w.product_units || 0));
+            totalProductsChart.data.datasets[0].backgroundColor = colorPalette(filteredWeeks.length);
             renderChart(totalProductsChart);
         }
 
@@ -296,12 +410,14 @@ function renderProductsOverviewCharts(products){
     if (productsOverviewUnitsChart) {
         productsOverviewUnitsChart.data.labels = labels;
         productsOverviewUnitsChart.data.datasets[0].data = units;
+        productsOverviewUnitsChart.data.datasets[0].backgroundColor = colorPalette(labels.length);
         renderChart(productsOverviewUnitsChart);
     }
 
     if (productsOverviewRevenueChart) {
         productsOverviewRevenueChart.data.labels = labels;
         productsOverviewRevenueChart.data.datasets[0].data = revenue;
+        productsOverviewRevenueChart.data.datasets[0].backgroundColor = colorPalette(labels.length);
         renderChart(productsOverviewRevenueChart);
     }
 }
@@ -385,9 +501,7 @@ async function renderCategoryPage() {
         if (categoryRevenueByWeekChart) {
             categoryRevenueByWeekChart.data.labels = revenueChartLabels;
             categoryRevenueByWeekChart.data.datasets[0].data = revenueChartValues;
-            categoryRevenueByWeekChart.data.datasets[0].backgroundColor = isWeekScoped
-                ? CATEGORY_COLORS.slice(0, revenueChartLabels.length)
-                : '#34d399';
+            categoryRevenueByWeekChart.data.datasets[0].backgroundColor = colorPalette(revenueChartLabels.length);
             renderChart(categoryRevenueByWeekChart);
         }
 
@@ -497,8 +611,7 @@ async function renderProductsPage() {
             const filteredProducts = filterChartData(data.charts.top_units_labels.slice(0, 7), data.charts.top_units_values.slice(0, 7));
             productsUnitsChart.data.labels = filteredProducts.labels;
             productsUnitsChart.data.datasets[0].data = filteredProducts.values;
-            const colors = ['#f5b942', '#38bdf8', '#a78bfa', '#fb7185', '#34d399', '#f97316', '#06b6d4'];
-            productsUnitsChart.data.datasets[0].backgroundColor = colors.slice(0, filteredProducts.labels.length);
+            productsUnitsChart.data.datasets[0].backgroundColor = colorPalette(filteredProducts.labels.length);
             renderChart(productsUnitsChart);
         }
 
@@ -543,6 +656,7 @@ function renderAnalyticsPage() {
     if (analyticsCapitaSpendChart) {
         analyticsCapitaSpendChart.data.labels = filteredSpend.labels;
         analyticsCapitaSpendChart.data.datasets[0].data = filteredSpend.values;
+        analyticsCapitaSpendChart.data.datasets[0].pointBackgroundColor = colorPalette(filteredSpend.labels.length);
         renderChart(analyticsCapitaSpendChart);
     }
 
@@ -651,7 +765,7 @@ function initCharts() {
         trendGradient.addColorStop(1, 'rgba(52,211,153,0.01)');
         trendChart = new Chart(trendCtx, {
             type: 'line',
-            data: { labels: [], datasets: [{ data: [], borderColor: '#34d399', backgroundColor: trendGradient, fill: true, tension: 0.35, borderWidth: 2.5, pointRadius: 4, pointBackgroundColor: '#0b120e', pointBorderColor: '#34d399', pointBorderWidth: 2 }] },
+            data: { labels: [], datasets: [{ data: [], borderColor: '#34d399', backgroundColor: trendGradient, fill: true, tension: 0.35, borderWidth: 2.5, pointRadius: 5, pointBackgroundColor: '#0b120e', pointBorderColor: '#0b120e', pointBorderWidth: 2 }] },
             options: {
                 responsive: true, maintainAspectRatio: false,
                 plugins: { legend: { display: false }, tooltip: { ...TOOLTIP_STYLE, callbacks: { label: (c) => ` $${fmt(c.parsed.y)} / attendee` } } },
@@ -948,7 +1062,7 @@ function updateOverviewDataOnly(ov) {
     const pct = ov.breakdown_pct;
 
     if (document.getElementById('ov-kpi-revenue')) document.getElementById('ov-kpi-revenue').textContent = `$${fmt(m.total_revenue)}`;
-    if (document.getElementById('ov-kpi-avg')) document.getElementById('ov-kpi-avg').textContent = `$${fmt(m.avg_revenue_per_week)} avg / week`;
+    if (document.getElementById('ov-kpi-avg')) document.getElementById('ov-kpi-avg').textContent = scoped ? scoped.label : 'All Weeks';
     if (document.getElementById('ov-kpi-orders')) document.getElementById('ov-kpi-orders').textContent = fmtInt(m.total_orders);
     if (document.getElementById('ov-kpi-customers')) document.getElementById('ov-kpi-customers').textContent = fmtInt(m.total_customers);
     if (document.getElementById('ov-kpi-avgspend')) document.getElementById('ov-kpi-avgspend').textContent = `$${fmt(m.avg_spend_per_attendee)}`;
@@ -1062,6 +1176,7 @@ function updateOverviewDataOnly(ov) {
         if (trendChart) {
             trendChart.data.labels = spendSeries.labels;
             trendChart.data.datasets[0].data = spendSeries.values;
+            trendChart.data.datasets[0].pointBackgroundColor = colorPalette(spendSeries.labels.length);
             renderChart(trendChart);
         }
     }
@@ -1164,9 +1279,11 @@ async function loadWeek(weekId) {
     updateOverviewDataOnly(await res.json());
 }
 
-function showEmpty() {
+function showEmpty(message) {
     hideAllDashboards();
     document.getElementById('empty-state').classList.remove('hidden');
+    const sub = document.getElementById('empty-state-sub');
+    if (sub) sub.textContent = message || 'Drag your two CSVs in below to get started.';
 }
 
 function hideMainHeaderActions() {
@@ -1182,6 +1299,15 @@ function showMainHeaderActions() {
 async function refresh() {
     try {
         const res = await fetch(`${API}/api/weeks`);
+        if (res.status === 404) {
+            // No CSVs uploaded yet (or nothing valid in them) - this is the
+            // normal first-run state, not a backend failure.
+            const data = await res.json().catch(() => ({}));
+            weeks = [];
+            showEmpty(data.error);
+            if (document.getElementById('sync-status')) document.getElementById('sync-status').textContent = 'Waiting for data';
+            return;
+        }
         if (!res.ok) throw new Error('API server down');
         const data = await res.json();
         weeks = data.weeks || [];
@@ -1224,7 +1350,7 @@ bindIfExists('btn-view-analytics', 'click', openAnalyticsPage);
 
 bindIfExists('modal-close', 'click', closeModal);
 bindIfExists('modal-overlay', 'click', (e) => { if (e.target.id === 'modal-overlay') closeModal(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModal(); closeUploadModal(); } });
 
 document.querySelectorAll('#products-table th[data-sort]').forEach((th) => {
     th.addEventListener('click', () => {

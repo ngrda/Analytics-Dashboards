@@ -11,17 +11,98 @@ app = Flask(__name__, static_folder=".")
 CORS(app)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Data now comes exclusively from what the user drags/uploads in the UI -
+# there is no bundled default dataset shipped with the app anymore. Both
+# CSVs live here once uploaded, and every route reads from these two paths.
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploaded_data")
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
-GLOBAL_CSV = os.path.join(DATA_DIR, "mlm_global.csv")
-INDI_CSV = os.path.join(DATA_DIR, "mlm_indi.csv")
+GLOBAL_CSV = os.path.join(UPLOAD_DIR, "mlm_global.csv")
+INDI_CSV = os.path.join(UPLOAD_DIR, "mlm_indi.csv")
 
 os.makedirs(EXPORT_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Every time the server (re)starts, wipe any CSVs left over from a previous
+# run - the user must drag in fresh files each run rather than silently
+# picking up whatever was uploaded last time.
+for _stale_path in (GLOBAL_CSV, INDI_CSV):
+    if os.path.exists(_stale_path):
+        os.remove(_stale_path)
+
+
+class DataNotAvailable(Exception):
+    """Raised anywhere a route needs the global or individual CSV before the
+    user has uploaded it. Caught by a single error handler below so every
+    route - not just the ones with an explicit check - fails the same clean
+    way instead of a raw 500 traceback."""
+    pass
+
+
+@app.errorhandler(DataNotAvailable)
+def handle_data_not_available(err):
+    return jsonify({"error": str(err)}), 404
 
 
 def clean_columns(df):
     df.columns = [re.sub(r"[\s\u00a0\u00ca\u00c2]+", " ", col).strip() for col in df.columns]
     return df
+
+
+# Columns on the global sheet that are always fixed metrics/metadata, never
+# swept into the dynamic "others" sub-categories below. Each is optional -
+# if a week's export is missing one, to_float()/`.get(..., 0)` default it to
+# 0 rather than erroring.
+FIXED_GLOBAL_COLUMNS = {
+    "Day", "Attendance", "Total Sales", "Net Sales",
+    "Polly's Total Sales", "Pioneer Total Sales",
+    "Polly's Sales", "Pioneer Sales",
+    "Popcorn", "Popcorn Sales",
+    "Snowcones", "Snowcones Sales",
+    "Temperature", "Category",
+}
+
+
+def normalize_key(name):
+    """Collapse a column name to bare alphanumerics so a units column can be
+    matched to its revenue column regardless of casing, hyphens, apostrophes,
+    or stray whitespace (e.g. 'Pop-A-Shot Sales' <-> 'Pop-a-shot')."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def split_sale_suffix(name):
+    """If a column name ends in 'Sale'/'Sales', it's a revenue column -
+    return (base_name, True). Otherwise it's a units column - (name, False)."""
+    m = re.match(r"^(.*?)\s+sales?$", name.strip(), re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), True
+    return name.strip(), False
+
+
+def discover_dynamic_categories(columns):
+    """Any global-sheet column that isn't on the fixed list and isn't the
+    'Others' $ total itself is a dynamic sub-category (Chairs, Candy, or
+    whatever new item shows up in a future week's export). Columns are
+    paired up - a unit-count column with its matching Sale/Sales column -
+    by normalized base name, so no category name is ever hardcoded. If a
+    category only has one side (e.g. a units column with no matching sales
+    column), it still shows up with the missing side defaulting to 0 rather
+    than being silently dropped. Order follows first appearance in the CSV.
+    """
+    leftover = [c for c in columns if c not in FIXED_GLOBAL_COLUMNS and c not in ("Others", "_id")]
+    order = []
+    pairs = {}
+    for col in leftover:
+        base, is_sales = split_sale_suffix(col)
+        key = normalize_key(base)
+        if key not in pairs:
+            pairs[key] = {"key": key, "label": base, "units_col": None, "sales_col": None}
+            order.append(key)
+        if is_sales:
+            pairs[key]["sales_col"] = col
+        else:
+            pairs[key]["units_col"] = col
+            pairs[key]["label"] = base  # prefer the units-column's casing for display
+    return [pairs[k] for k in order]
 
 
 def format_day(day_value):
@@ -39,8 +120,14 @@ def is_valid_day(day_value):
 
 
 def load_csv(path):
+    if not os.path.exists(path):
+        kind = "Global" if path == GLOBAL_CSV else "Individual products"
+        raise DataNotAvailable(f"{kind} CSV has not been uploaded yet")
     df = pd.read_csv(path, sep=";", encoding="latin-1")
     df = clean_columns(df)
+    if "Day" not in df.columns:
+        kind = "Global" if path == GLOBAL_CSV else "Individual products"
+        raise DataNotAvailable(f"{kind} CSV is missing a 'Day' column - check the file and re-upload")
     # Drop any row that doesn't have a real, parseable date in Day (e.g.
     # trailing blank lines some spreadsheet exports leave at the end of the
     # file) - a row with no valid date is not a week.
@@ -88,31 +175,131 @@ def load_merged():
     global_df = load_csv(GLOBAL_CSV)
     indi_df = load_csv(INDI_CSV)
 
+    dynamic_cats = discover_dynamic_categories(global_df.columns)
+
     global_df["_id"] = global_df["Day"].apply(day_to_id)
     indi_df["_id"] = indi_df["Day"].apply(day_to_id)
 
-    return global_df, indi_df
+    return global_df, indi_df, dynamic_cats
 
 
-def brand_avg_prices(global_row):
-    """Real average price per unit for each brand, derived from actual sales
-    totals in the global sheet. If a brand sold zero units that week there is
-    no real price to derive, so we return 0 instead of inventing a number
-    (units are 0 anyway, so revenue = units * price is unaffected)."""
-    polly_units = to_float(global_row.get("Polly's Total Sales", 0))
-    polly_revenue = to_float(global_row.get("Polly's Sales", 0))
-    pioneer_units = to_float(global_row.get("Pioneer Total Sales", 0))
-    pioneer_revenue = to_float(global_row.get("Pioneer Sales", 0))
+def resolve_brand_figures(global_row, indi_row, dynamic_cats):
+    """Real per-brand units + revenue for the week, filling in a brand's
+    numbers if its 'Total Sales'/'Sales' columns are blank in the global
+    sheet. fillna(0) leaves no way to tell "blank cell" from "genuinely sold
+    zero", so we treat "reported units column is 0 but the individual-flavor
+    sheet shows real units sold" as evidence the cell was blank, not a
+    zero-sales week.
 
+    Units always come from the individual-flavor sheet (mlm_indi.csv) when
+    it has any - that number is real regardless of what the global sheet
+    says. Revenue for a missing brand is backed out algebraically from Net
+    Sales, since:
+        Net Sales = Popcorn + Snowcones + Polly + Pioneer + Others
+    so if every other component is known, the missing one is just:
+        missing_revenue = Net Sales - (every other known component)
+    This only works when exactly ONE brand is missing that week - if both
+    are missing there's no way to know how to split the remainder between
+    them, so we fall back to the sheet's reported (0) values rather than
+    guess a split.
+    """
+    product_cols = [c for c in indi_row.index if c not in ("Day", "_id")]
+    polly_units_by_name = {n: int(indi_row[n]) for n in product_cols if n.startswith("Polly")}
+    pioneer_units_by_name = {n: int(indi_row[n]) for n in product_cols if n.startswith("Pioneer")}
+    polly_units_actual = sum(polly_units_by_name.values())
+    pioneer_units_actual = sum(pioneer_units_by_name.values())
+
+    polly_units_reported = to_float(global_row.get("Polly's Total Sales", 0))
+    pioneer_units_reported = to_float(global_row.get("Pioneer Total Sales", 0))
+    polly_revenue_reported = round(to_float(global_row.get("Polly's Sales", 0)), 2)
+    pioneer_revenue_reported = round(to_float(global_row.get("Pioneer Sales", 0)), 2)
+
+    polly_missing = polly_units_reported == 0 and polly_units_actual > 0
+    pioneer_missing = pioneer_units_reported == 0 and pioneer_units_actual > 0
+
+    popcorn_revenue = round(to_float(global_row.get("Popcorn Sales", 0)), 2)
+    snowcone_revenue = round(to_float(global_row.get("Snowcones Sales", 0)), 2)
+    others_revenue_total = round(
+        sum(to_float(global_row.get(cat["sales_col"], 0)) for cat in dynamic_cats if cat["sales_col"]), 2
+    )
+    net_sales = to_float(global_row.get("Net Sales", 0))
+
+    polly_units = polly_units_actual if polly_units_actual else polly_units_reported
+    pioneer_units = pioneer_units_actual if pioneer_units_actual else pioneer_units_reported
+    polly_revenue = polly_revenue_reported
+    pioneer_revenue = pioneer_revenue_reported
+    inferred = None
+
+    if polly_missing and not pioneer_missing:
+        polly_revenue = round(
+            net_sales - (popcorn_revenue + snowcone_revenue + pioneer_revenue_reported + others_revenue_total), 2
+        )
+        inferred = "polly"
+    elif pioneer_missing and not polly_missing:
+        pioneer_revenue = round(
+            net_sales - (popcorn_revenue + snowcone_revenue + polly_revenue_reported + others_revenue_total), 2
+        )
+        inferred = "pioneer"
+
+    return {
+        "polly_units": polly_units,
+        "polly_revenue": polly_revenue,
+        "pioneer_units": pioneer_units,
+        "pioneer_revenue": pioneer_revenue,
+        "polly_units_by_name": polly_units_by_name,
+        "pioneer_units_by_name": pioneer_units_by_name,
+        "inferred": inferred,
+    }
+
+
+def brand_avg_prices(polly_units, polly_revenue, pioneer_units, pioneer_revenue):
+    """Average price per unit for each brand from its (possibly inferred,
+    see resolve_brand_figures) units + revenue. If a brand sold zero units
+    that week there is no real price to derive, so we return 0 instead of
+    inventing a number (units are 0 anyway, so revenue = units * price is
+    unaffected)."""
     polly_price = round(polly_revenue / polly_units, 2) if polly_units else 0.0
     pioneer_price = round(pioneer_revenue / pioneer_units, 2) if pioneer_units else 0.0
     return polly_price, pioneer_price
 
 
-def build_top_products(global_row, indi_row):
+def distribute_revenue(units_by_name, total_revenue):
+    """Split a brand's real $ revenue for the week across its individual
+    flavors in proportion to units sold, using the largest-remainder method
+    so the per-flavor figures always sum EXACTLY to the real revenue column
+    (to the cent) - unlike a flat units * avg_price estimate, which drifts
+    a few cents once a rounded price is multiplied out across many flavors
+    and summed back up. That drift was why per-product revenue totals
+    (Top Products, Products page) didn't match the week's real revenue.
+    Returns {name: revenue} covering every key in units_by_name."""
+    total_units = sum(units_by_name.values())
+    total_cents = round(total_revenue * 100)
+    if total_units <= 0 or total_cents == 0:
+        return {name: 0.0 for name in units_by_name}
+
+    raw_shares = {name: (units / total_units) * total_cents for name, units in units_by_name.items()}
+    floor_cents = {name: int(share) for name, share in raw_shares.items()}
+    remainder = int(round(total_cents - sum(floor_cents.values())))
+
+    # Hand out the leftover pennies to whichever flavors had the largest
+    # fractional remainder, so the total lands exactly on total_revenue.
+    order = sorted(units_by_name.keys(), key=lambda n: (raw_shares[n] - floor_cents[n]), reverse=True)
+    for name in order[:remainder]:
+        floor_cents[name] += 1
+
+    return {name: round(cents / 100, 2) for name, cents in floor_cents.items()}
+
+
+def build_top_products(global_row, indi_row, dynamic_cats):
     products = []
     product_cols = [c for c in indi_row.index if c not in ("Day", "_id")]
-    polly_price, pioneer_price = brand_avg_prices(global_row)
+    figures = resolve_brand_figures(global_row, indi_row, dynamic_cats)
+    polly_price, pioneer_price = brand_avg_prices(
+        figures["polly_units"], figures["polly_revenue"], figures["pioneer_units"], figures["pioneer_revenue"]
+    )
+
+    polly_revenue_by_name = distribute_revenue(figures["polly_units_by_name"], figures["polly_revenue"])
+    pioneer_revenue_by_name = distribute_revenue(figures["pioneer_units_by_name"], figures["pioneer_revenue"])
 
     for name in product_cols:
         units = int(indi_row[name])
@@ -120,12 +307,14 @@ def build_top_products(global_row, indi_row):
         brand = "Polly's Pop" if is_polly else "Pioneer"
         clean_name = re.sub(r"^(Polly|Pioneer)\s+", "", name).strip()
         avg_price = polly_price if is_polly else pioneer_price
+        revenue = (polly_revenue_by_name if is_polly else pioneer_revenue_by_name)[name]
         products.append({
             "name": f"{brand} {clean_name}",
             "units": units,
             "price": round(avg_price, 2),
-            "revenue": round(units * avg_price, 2),
+            "revenue": revenue,
             "category": "soda",
+            "revenue_estimated": figures["inferred"] == ("polly" if is_polly else "pioneer"),
         })
 
     # Only beverages (soda) are shown in the Top Selling Products list.
@@ -133,64 +322,67 @@ def build_top_products(global_row, indi_row):
     return sorted(products, key=lambda p: p["units"], reverse=True)
 
 
-def build_week_payload(global_row, indi_row, index, prev_global_row=None):
+def build_week_payload(global_row, indi_row, index, dynamic_cats, prev_global_row=None):
     revenue = to_float(global_row["Net Sales"])
     prev_revenue = float(prev_global_row["Net Sales"]) if prev_global_row is not None else 0
 
     popcorn_units = int(to_float(global_row["Popcorn"]))
     snowcone_units = int(to_float(global_row["Snowcones"]))
-    
-    # For Polly's Pop and Pioneer, we sum the units from the indi_row based on the product names starting with "Polly" or "Pioneer"
-    polly_units = sum(int(v) for k, v in indi_row.items() if k.startswith("Polly"))
-    pioneer_units = sum(int(v) for k, v in indi_row.items() if k.startswith("Pioneer"))
-    
-    # Real unit counts for the "others" sub-categories, straight from their
-    # dedicated unit columns in the CSV (Chairs, Pop-a-shot, Raffle Tickets,
-    # Nee-Dohs, Candy) - NOT the "Others" $ column, which is a revenue total.
-    others_chairs_units = int(to_float(global_row.get("Chairs", 0)))
-    others_pop_a_shot_units = int(to_float(global_row.get("Pop-a-shot", 0)))
-    others_raffle_units = int(to_float(global_row.get("Raffle-Tickets", 0)))
-    others_nee_dohs_units = int(to_float(global_row.get("Nee-Dohs", 0)))
-    others_candy_units = int(to_float(global_row.get("Candy", 0)))
-    others_units = (others_chairs_units + others_pop_a_shot_units + others_raffle_units
-                     + others_nee_dohs_units + others_candy_units)
+
+    # Real per-brand units + revenue, with a missing brand's revenue backed
+    # out from Net Sales when the global sheet has a blank cell for it (see
+    # resolve_brand_figures docstring).
+    brand_figures = resolve_brand_figures(global_row, indi_row, dynamic_cats)
+    polly_units = brand_figures["polly_units"]
+    pioneer_units = brand_figures["pioneer_units"]
+
+    # Real unit counts and $ revenue for every dynamic "others" sub-category
+    # (Chairs, Pop-a-shot, Raffle Tickets, Nee-Dohs, Candy, or whatever else
+    # shows up in this dataset's columns), straight from each one's own
+    # dedicated units/sales column pair - NOT the "Others" $ total column,
+    # which is just a reported grand total we reconcile against below.
+    others_units = {}
+    others_breakdown = {}
+    for cat in dynamic_cats:
+        units_val = int(to_float(global_row.get(cat["units_col"], 0))) if cat["units_col"] else 0
+        sales_val = round(to_float(global_row.get(cat["sales_col"], 0)), 2) if cat["sales_col"] else 0.0
+        others_units[cat["key"]] = units_val
+        others_breakdown[cat["key"]] = sales_val
+
+    others_units_total = sum(others_units.values())
+    others_revenue_total = round(sum(others_breakdown.values()), 2)
+
+    # Reconciliation check: the source "Others" column is a reported $ total -
+    # compare it to what our dynamic sub-categories actually sum to, and flag
+    # any mismatch instead of silently trusting either number.
+    reported_others_total = round(to_float(global_row.get("Others", 0)), 2)
+    others_check_diff = round(reported_others_total - others_revenue_total, 2)
 
     mix = {
         "popcorn": popcorn_units,
         "snowcones": snowcone_units,
         "polly": polly_units,
         "pioneer": pioneer_units,
-        "others": others_units,
+        "others": others_units_total,
     }
     mix_total = sum(mix.values())
     mix_pct = {k: round((v / mix_total) * 100, 1) if mix_total else 0 for k, v in mix.items()}
 
-    top_products = build_top_products(global_row, indi_row)
+    top_products = build_top_products(global_row, indi_row, dynamic_cats)
     soda_total = sum(p["units"] for p in top_products)  # sodas only (Polly's + Pioneer)
     product_units = int(to_float(global_row["Total Sales"]))  # kept equal to total_orders, same number
 
-    # Real dollar revenue for each "others" sub-category, from its dedicated
-    # sales column (Chairs Sale, Pop-A-Shot Sales, Raffle Tickets Sales,
-    # Nee-Dohs Sale, Candy Sales) - these are the actual $ columns, distinct
-    # from the unit-count columns used above.
-    others_breakdown = {
-        "chairs": round(to_float(global_row.get("Chairs Sale", 0)), 2),
-        "pop_a_shot": round(to_float(global_row.get("Pop-A-Shot Sales", 0)), 2),
-        "raffle_tickets": round(to_float(global_row.get("Raffle-Tickets Sales", 0)), 2),
-        "nee_dohs": round(to_float(global_row.get("Nee-Dohs Sale", 0)), 2),
-        "candy": round(to_float(global_row.get("Candy Sales", 0)), 2),
-    }
-    others_labels = ["Chairs", "Pop-A-Shot", "Raffle Tickets", "Nee-Dohs", "Candy"]
-    others_values = [others_breakdown["chairs"], others_breakdown["pop_a_shot"],
-                      others_breakdown["raffle_tickets"], others_breakdown["nee_dohs"], others_breakdown["candy"]]
+    others_labels = [cat["label"] for cat in dynamic_cats]
+    others_values = [others_breakdown[cat["key"]] for cat in dynamic_cats]
     # Real unit counts aligned to others_labels order (for the units chart).
-    others_units_list = [others_chairs_units, others_pop_a_shot_units, others_raffle_units,
-                          others_nee_dohs_units, others_candy_units]
+    others_units_list = [others_units[cat["key"]] for cat in dynamic_cats]
 
     # Real dollar revenue for Polly's Pop / Pioneer straight from the sales
-    # columns (not an estimate), so these categories reflect actual sales.
-    polly_revenue = round(to_float(global_row.get("Polly's Sales", 0)), 2)
-    pioneer_revenue = round(to_float(global_row.get("Pioneer Sales", 0)), 2)
+    # columns - unless one of them was blank in the source sheet, in which
+    # case brand_figures already backed it out from Net Sales (see
+    # resolve_brand_figures).
+    polly_revenue = round(brand_figures["polly_revenue"], 2)
+    pioneer_revenue = round(brand_figures["pioneer_revenue"], 2)
 
     # Popcorn & Snowcones DO have dedicated $ columns in the source data
     # ("Popcorn Sales", "Snowcones Sales") - read them directly instead of
@@ -203,15 +395,13 @@ def build_week_payload(global_row, indi_row, index, prev_global_row=None):
         "snowcones": snowcone_revenue,
         "polly": polly_revenue,
         "pioneer": pioneer_revenue,
-        "others": round(sum(others_breakdown.values()), 2),
+        "others": others_revenue_total,
     }
 
     combined_labels = ["Popcorn", "Snowcones", "Polly's Pop", "Pioneer"] + others_labels
     combined_values = [mix_revenue["popcorn"], mix_revenue["snowcones"], mix_revenue["polly"], mix_revenue["pioneer"]] + others_values
     # Units aligned to the same combined_labels order (revenue and unit views share one legend).
     combined_units = [mix["popcorn"], mix["snowcones"], mix["polly"], mix["pioneer"]] + others_units_list
-
-
 
     day = format_day(global_row["Day"])
     category = str(global_row.get("Category", "")).strip()
@@ -238,17 +428,20 @@ def build_week_payload(global_row, indi_row, index, prev_global_row=None):
             "total_deliveries": int(to_float(global_row["Popcorn"])) + int(to_float(global_row["Snowcones"])),
             "total_popcorn": int(to_float(global_row["Popcorn"])),
             "total_snowcones": int(to_float(global_row["Snowcones"])),
-            "total_chairs": int(to_float(global_row.get("Chairs", 0))),
-            "total_pop_a_shot": int(to_float(global_row.get("Pop-a-shot", 0))),
-            "total_raffle_tickets": int(to_float(global_row.get("Raffle-Tickets", 0))),
-            "total_nee_dohs": int(to_float(global_row.get("Nee-Dohs", 0))),
-            "total_candy": int(to_float(global_row.get("Candy", 0))),
             "avg_spend_per_attendee": avg_spend,
         },
         "breakdown": mix,
         "breakdown_pct": mix_pct,
         "breakdown_revenue": mix_revenue,
         "others_breakdown": others_breakdown,
+        "others_units": others_units,
+        "others_categories": dynamic_cats,  # [{key, label, units_col, sales_col}] - same set for every week in this dataset
+        "others_check": {
+            "reported_total": reported_others_total,
+            "computed_total": others_revenue_total,
+            "diff": others_check_diff,
+        },
+        "brand_revenue_estimated": brand_figures["inferred"],  # "polly", "pioneer", or None
         "top_products": top_products,
         "charts": {
             "labels": ["Popcorn", "Snowcones", "Polly's Pop", "Pioneer", "Others"],
@@ -268,7 +461,7 @@ def build_week_payload(global_row, indi_row, index, prev_global_row=None):
 
 
 def get_all_weeks():
-    global_df, indi_df = load_merged()
+    global_df, indi_df, dynamic_cats = load_merged()
     weeks = []
     product_cols = [c for c in indi_df.columns if c not in ("Day", "_id")]
 
@@ -278,19 +471,19 @@ def get_all_weeks():
         if indi_match.empty:
             # No soda-flavor row for this week in mlm_indi.csv - use zeros for
             # the soda breakdown only, but still keep this week's real data
-            # (Popcorn, Snowcones, Chairs, Nee-Dohs, Candy, etc. all come from
-            # mlm_global.csv and must not be dropped just because the
-            # separate soda-flavor file is missing this day).
+            # (Popcorn, Snowcones, and every dynamic "others" sub-category all
+            # come from mlm_global.csv and must not be dropped just because
+            # the separate soda-flavor file is missing this day).
             indi_row = pd.Series({c: 0 for c in product_cols})
         else:
             indi_row = indi_match.iloc[0]
-        weeks.append(build_week_payload(grow, indi_row, i, prev))
+        weeks.append(build_week_payload(grow, indi_row, i, dynamic_cats, prev))
 
     return weeks
 
 
 def build_products_catalog(scope_week_id=None):
-    global_df, indi_df = load_merged()
+    global_df, indi_df, dynamic_cats = load_merged()
     weeks_meta = []
 
     for i, (_, grow) in enumerate(global_df.iterrows()):
@@ -313,7 +506,15 @@ def build_products_catalog(scope_week_id=None):
     for wm in weeks_meta:
         grow = global_df[global_df["_id"] == wm["id"]].iloc[0]
         indi_row = indi_df[indi_df["_id"] == wm["id"]].iloc[0]
-        polly_price, pioneer_price = brand_avg_prices(grow)
+        figures = resolve_brand_figures(grow, indi_row, dynamic_cats)
+        polly_price, pioneer_price = brand_avg_prices(
+            figures["polly_units"], figures["polly_revenue"], figures["pioneer_units"], figures["pioneer_revenue"]
+        )
+
+        polly_units_by_name = figures["polly_units_by_name"]
+        pioneer_units_by_name = figures["pioneer_units_by_name"]
+        polly_revenue_by_name = distribute_revenue(polly_units_by_name, figures["polly_revenue"])
+        pioneer_revenue_by_name = distribute_revenue(pioneer_units_by_name, figures["pioneer_revenue"])
 
         for name in product_cols:
             units = int(indi_row[name])
@@ -322,6 +523,7 @@ def build_products_catalog(scope_week_id=None):
             clean_name = re.sub(r"^(Polly|Pioneer)\s+", "", name).strip()
             display_name = f"{brand} {clean_name}"
             price = polly_price if is_polly else pioneer_price
+            week_revenue = (polly_revenue_by_name if is_polly else pioneer_revenue_by_name)[name]
 
             entry = catalog.setdefault(display_name, {
                 "name": display_name,
@@ -333,13 +535,13 @@ def build_products_catalog(scope_week_id=None):
                 "weekly": [],
             })
             entry["units"] += units
-            entry["revenue"] += round(units * price, 2)
+            entry["revenue"] += week_revenue
             entry["weekly"].append({
                 "week_id": wm["id"],
                 "week_label": wm["label"],
                 "date": wm["date"],
                 "units": units,
-                "revenue": round(units * price, 2),
+                "revenue": week_revenue,
             })
 
     products = []
@@ -370,11 +572,10 @@ def build_weekly_detail():
         "avg_spend": w["metrics"]["avg_spend_per_attendee"],
         "popcorn": w["metrics"]["total_popcorn"],
         "snowcones": w["metrics"]["total_snowcones"],
-        "chairs": w["metrics"]["total_chairs"],
-        "pop_a_shot": w["metrics"]["total_pop_a_shot"],
-        "raffle_tickets": w["metrics"]["total_raffle_tickets"],
-        "nee_dohs": w["metrics"]["total_nee_dohs"],
-        "candy": w["metrics"]["total_candy"],
+        # Dynamic "others" sub-categories (Chairs, Candy, whatever else the
+        # CSV has this dataset), keyed by normalized category key.
+        "others_units": w["others_units"],
+        "others_revenue": w["others_breakdown"],
         "others_total": round(sum(w["others_breakdown"].values()), 2),
     } for w in weeks]
 
@@ -403,22 +604,19 @@ def build_soda_products(weeks):
 
 def build_all_products(weeks):
     """Every sellable item across a list of weeks: sodas + popcorn + snowcones +
-    chairs + pop-a-shot + raffle tickets + nee-dohs + candy. Built on top of
-    build_soda_products so soda flavors and non-soda categories share one list."""
+    whatever dynamic "others" sub-categories this dataset has (chairs,
+    pop-a-shot, raffle tickets, nee-dohs, candy, or new ones as they appear).
+    Built on top of build_soda_products so soda flavors and non-soda
+    categories share one list."""
     totals = {p["name"]: dict(p) for p in build_soda_products(weeks)}
 
     # (display name, category key, per-week units getter, per-week revenue getter)
-    extra_categories = [
+    fixed_categories = [
         ("Popcorn", "popcorn", lambda w: w["metrics"]["total_popcorn"], lambda w: w["breakdown_revenue"]["popcorn"]),
         ("Snowcones", "snowcones", lambda w: w["metrics"]["total_snowcones"], lambda w: w["breakdown_revenue"]["snowcones"]),
-        ("Chairs", "chairs", lambda w: w["metrics"]["total_chairs"], lambda w: w["others_breakdown"]["chairs"]),
-        ("Pop-A-Shot", "pop_a_shot", lambda w: w["metrics"]["total_pop_a_shot"], lambda w: w["others_breakdown"]["pop_a_shot"]),
-        ("Raffle Tickets", "raffle_tickets", lambda w: w["metrics"]["total_raffle_tickets"], lambda w: w["others_breakdown"]["raffle_tickets"]),
-        ("Nee-Dohs", "nee_dohs", lambda w: w["metrics"]["total_nee_dohs"], lambda w: w["others_breakdown"]["nee_dohs"]),
-        ("Candy", "candy", lambda w: w["metrics"]["total_candy"], lambda w: w["others_breakdown"]["candy"]),
     ]
 
-    for name, category, units_fn, revenue_fn in extra_categories:
+    for name, category, units_fn, revenue_fn in fixed_categories:
         units = sum(units_fn(w) for w in weeks)
         revenue = round(sum(revenue_fn(w) for w in weeks), 2)
         if units > 0:
@@ -430,24 +628,36 @@ def build_all_products(weeks):
                 "price": round(revenue / units, 2) if units else 0,
             }
 
+    dynamic_cats = weeks[0]["others_categories"] if weeks else []
+    for cat in dynamic_cats:
+        key = cat["key"]
+        units = sum(w["others_units"].get(key, 0) for w in weeks)
+        revenue = round(sum(w["others_breakdown"].get(key, 0) for w in weeks), 2)
+        if units > 0:
+            totals[cat["label"]] = {
+                "name": cat["label"],
+                "units": units,
+                "revenue": revenue,
+                "category": key,
+                "price": round(revenue / units, 2) if units else 0,
+            }
+
     return sorted(totals.values(), key=lambda p: p["revenue"], reverse=True)
 
 
 def build_category_breakdown(weeks):
-    """Group every sellable item into 9 broad categories (all Polly's Pop
-    flavors combined into one row, all Pioneer flavors combined into another)
-    instead of listing every individual flavor."""
+    """Group every sellable item into broad categories (all Polly's Pop
+    flavors combined into one row, all Pioneer flavors combined into another,
+    plus whatever dynamic "others" sub-categories this dataset has) instead
+    of listing every individual flavor."""
     cat_defs = [
         ("Popcorn", "popcorn"),
         ("Snowcones", "snowcones"),
         ("Polly's Pop", "polly"),
         ("Pioneer", "pioneer"),
-        ("Chairs", "chairs"),
-        ("Pop-A-Shot", "pop_a_shot"),
-        ("Raffle Tickets", "raffle_tickets"),
-        ("Nee-Dohs", "nee_dohs"),
-        ("Candy", "candy"),
     ]
+    dynamic_cats = weeks[0]["others_categories"] if weeks else []
+    cat_defs += [(cat["label"], cat["key"]) for cat in dynamic_cats]
     weekly_by_cat = {key: [] for _, key in cat_defs}
 
     for w in weeks:
@@ -459,12 +669,10 @@ def build_category_breakdown(weeks):
             "snowcones": (w["metrics"]["total_snowcones"], w["breakdown_revenue"]["snowcones"]),
             "polly": (polly_units, w["breakdown_revenue"]["polly"]),
             "pioneer": (pioneer_units, w["breakdown_revenue"]["pioneer"]),
-            "chairs": (w["metrics"]["total_chairs"], w["others_breakdown"]["chairs"]),
-            "pop_a_shot": (w["metrics"]["total_pop_a_shot"], w["others_breakdown"]["pop_a_shot"]),
-            "raffle_tickets": (w["metrics"]["total_raffle_tickets"], w["others_breakdown"]["raffle_tickets"]),
-            "nee_dohs": (w["metrics"]["total_nee_dohs"], w["others_breakdown"]["nee_dohs"]),
-            "candy": (w["metrics"]["total_candy"], w["others_breakdown"]["candy"]),
         }
+        for cat in dynamic_cats:
+            key = cat["key"]
+            per_week_values[key] = (w["others_units"].get(key, 0), w["others_breakdown"].get(key, 0))
 
         for _, key in cat_defs:
             units, revenue = per_week_values[key]
@@ -562,6 +770,101 @@ def serve_js():
     return send_from_directory(BASE_DIR, "app.js")
 
 
+def parse_uploaded_csv(file_storage):
+    """Read an uploaded file into memory and parse it exactly the way
+    load_csv() reads the on-disk files (';'-separated, latin-1), without
+    writing anything yet. Returns (raw_bytes, cleaned_df, valid_week_count)
+    or raises ValueError with a human-readable reason - callers decide what
+    to do with a bad file, nothing is saved to disk from in here."""
+    raw = file_storage.read()
+    if not raw:
+        raise ValueError("The file is empty")
+    try:
+        text = raw.decode("latin-1")
+    except UnicodeDecodeError:
+        raise ValueError("Could not read the file's text encoding")
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=";")
+    except Exception as e:
+        raise ValueError(f"Could not parse as a semicolon-separated CSV ({e})")
+    df = clean_columns(df)
+    if "Day" not in df.columns:
+        raise ValueError("No 'Day' column found - is this the right file?")
+    valid_weeks = int(df["Day"].apply(is_valid_day).sum())
+    if valid_weeks == 0:
+        raise ValueError("No rows with a valid d/m/yy date in 'Day' were found")
+    return raw, df, valid_weeks
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_data():
+    """Accepts one or both CSVs as multipart form fields named 'global' and
+    'individual' (matching the two dropzones in the UI) and, once each one
+    parses cleanly, overwrites the file that every other route reads from.
+    A bad file is rejected before anything on disk changes."""
+    global_file = request.files.get("global")
+    indi_file = request.files.get("individual")
+
+    if not global_file and not indi_file:
+        return jsonify({"error": "No file received - attach a 'global' and/or 'individual' CSV"}), 400
+
+    result = {"status": "ok"}
+
+    # uploaded_data/ is only created once at startup - if it gets deleted or
+    # evicted (e.g. by iCloud/Desktop sync) while the server keeps running,
+    # writes below would 500 with a raw FileNotFoundError. Recreate it here,
+    # right before we actually need it, so a vanished folder self-heals
+    # instead of taking the whole upload down.
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"Could not prepare the uploads folder: {e}"}), 500
+
+    if global_file:
+        try:
+            raw, df, week_count = parse_uploaded_csv(global_file)
+        except ValueError as e:
+            return jsonify({"error": f"Global CSV: {e}"}), 400
+        dynamic_cats = discover_dynamic_categories(df.columns)
+        try:
+            with open(GLOBAL_CSV, "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            return jsonify({"error": f"Could not save the global CSV to disk: {e}"}), 500
+        result["global"] = {
+            "filename": global_file.filename,
+            "weeks_detected": week_count,
+            "dynamic_categories": [c["label"] for c in dynamic_cats],
+        }
+
+    if indi_file:
+        try:
+            raw, df, week_count = parse_uploaded_csv(indi_file)
+        except ValueError as e:
+            return jsonify({"error": f"Individual products CSV: {e}"}), 400
+        try:
+            with open(INDI_CSV, "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            return jsonify({"error": f"Could not save the individual products CSV to disk: {e}"}), 500
+        result["individual"] = {
+            "filename": indi_file.filename,
+            "weeks_detected": week_count,
+            "products_detected": len([c for c in df.columns if c != "Day"]),
+        }
+
+    return jsonify(result)
+
+
+
+@app.route("/api/status", methods=["GET"])
+def data_status():
+    return jsonify({
+        "global_uploaded": os.path.exists(GLOBAL_CSV),
+        "individual_uploaded": os.path.exists(INDI_CSV),
+    })
+
+
 @app.route("/api/overview", methods=["GET"])
 def get_overview():
     if not os.path.exists(GLOBAL_CSV) or not os.path.exists(INDI_CSV):
@@ -597,20 +900,14 @@ def get_overview():
     revenue_mix_keys = ["popcorn", "snowcones", "polly", "pioneer"]
     revenue_mix_totals = {k: round(sum(w["breakdown_revenue"][k] for w in weeks), 2) for k in revenue_mix_keys}
 
-    others_keys = ["chairs", "pop_a_shot", "raffle_tickets", "nee_dohs", "candy"]
-    others_totals = {k: round(sum(w["others_breakdown"][k] for w in weeks), 2) for k in others_keys}
-    others_labels = ["Chairs", "Pop-A-Shot", "Raffle Tickets", "Nee-Dohs", "Candy"]
+    dynamic_cats = weeks[0]["others_categories"] if weeks else []
+    others_keys = [cat["key"] for cat in dynamic_cats]
+    others_labels = [cat["label"] for cat in dynamic_cats]
+    others_totals = {k: round(sum(w["others_breakdown"].get(k, 0) for w in weeks), 2) for k in others_keys}
     others_values = [others_totals[k] for k in others_keys]
-    # Real unit totals for each "others" sub-category, from the week metrics
-    # (total_chairs, total_pop_a_shot, etc.) - NOT the dollar revenue values.
-    others_unit_metric_keys = {
-        "chairs": "total_chairs",
-        "pop_a_shot": "total_pop_a_shot",
-        "raffle_tickets": "total_raffle_tickets",
-        "nee_dohs": "total_nee_dohs",
-        "candy": "total_candy",
-    }
-    others_units_totals = {k: sum(w["metrics"][m] for w in weeks) for k, m in others_unit_metric_keys.items()}
+    # Real unit totals for each "others" sub-category, from each week's
+    # others_units dict - NOT the dollar revenue values.
+    others_units_totals = {k: sum(w["others_units"].get(k, 0) for w in weeks) for k in others_keys}
     others_units_values = [others_units_totals[k] for k in others_keys]
 
     combined_labels = ["Popcorn", "Snowcones", "Polly's Pop", "Pioneer"] + others_labels
@@ -934,7 +1231,7 @@ def export_all_csv():
     if not weeks:
         return jsonify({"error": "No data"}), 404
 
-    global_df, _ = load_merged()
+    global_df, _, _dynamic_cats = load_merged()
     buffer = io.StringIO()
     global_df.drop(columns=["_id"]).to_csv(buffer, sep=";", index=False)
     content = buffer.getvalue()
